@@ -64,6 +64,7 @@
 //               optional connection to the GLVis tool for visualization.
 
 #include "mfem.hpp"
+#include "strumpack_coordinates.hpp"
 #include <fstream>
 #include <iostream>
 
@@ -78,7 +79,10 @@ int main(int argc, char *argv[])
    int myid = Mpi::WorldRank();
    Hypre::Init();
 
-   // 2. Parse command-line options.
+   // 2. Parse command-line options (STRUMPACK's go after a lone "--").
+   int sp_argc;
+   std::vector<char *> sp_argv;
+   SplitStrumpackArgs(argc, argv, sp_argc, sp_argv);
    const char *mesh_file = "../data/star.mesh";
    int order = 1;
    bool static_cond = false;
@@ -90,6 +94,10 @@ int main(int argc, char *argv[])
 #ifdef MFEM_USE_CUDSS
    bool cudss_solver = false;
 #endif
+   int ser_ref_levels = -1;
+   int par_ref_levels = 2;
+   bool strumpack_solver = false;
+   bool save = true;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -114,6 +122,19 @@ int main(int argc, char *argv[])
    args.AddOption(&cudss_solver, "-cudss", "--cudss-solver", "-no-cudss",
                   "--no-cudss-solver", "Use the cuDSS Solver.");
 #endif
+   args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
+                  "Uniform refinements of the serial mesh (-1: up to"
+                  " 10,000 elements).");
+   args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",
+                  "Uniform refinements of the parallel mesh.");
+#ifdef MFEM_USE_STRUMPACK
+   args.AddOption(&strumpack_solver, "-sp", "--strumpack-solver",
+                  "-no-sp", "--no-strumpack-solver",
+                  "Use the STRUMPACK solver; its options go after a lone"
+                  " \"--\" (e.g. -- --sp_compression h2).");
+#endif
+   args.AddOption(&save, "-save", "--save-solution", "-no-save",
+                  "--no-save-solution", "Save the mesh and the solution.");
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
@@ -147,8 +168,8 @@ int main(int argc, char *argv[])
    //    'ref_levels' to be the largest number that gives a final mesh with no
    //    more than 10,000 elements.
    {
-      int ref_levels =
-         (int)floor(log(10000./mesh.GetNE())/log(2.)/dim);
+      int ref_levels = ser_ref_levels >= 0 ? ser_ref_levels :
+                       (int)floor(log(10000./mesh.GetNE())/log(2.)/dim);
       for (int l = 0; l < ref_levels; l++)
       {
          mesh.UniformRefinement();
@@ -161,7 +182,6 @@ int main(int argc, char *argv[])
    ParMesh pmesh(MPI_COMM_WORLD, mesh);
    mesh.Clear();
    {
-      int par_ref_levels = 2;
       for (int l = 0; l < par_ref_levels; l++)
       {
          pmesh.UniformRefinement();
@@ -259,6 +279,28 @@ int main(int argc, char *argv[])
    // 13. Solve the linear system A X = B.
    //     * With full assembly, use the BoomerAMG preconditioner from hypre.
    //     * With partial assembly, use Jacobi smoothing, for now.
+   //     * With -sp, STRUMPACK, given the coordinates of the unknowns (its
+   //       H2 compression needs them unless the ordering is GEOMETRIC).
+   StopWatch solve_time;
+   solve_time.Start();
+#ifdef MFEM_USE_STRUMPACK
+   if (strumpack_solver)
+   {
+      MFEM_VERIFY(!pa && !static_cond,
+                  "-sp needs an assembled matrix without static condensation");
+      STRUMPACKRowLocMatrix SA(*A.As<HypreParMatrix>());
+      STRUMPACKCoordinatesSolver strumpack(MPI_COMM_WORLD, sp_argc,
+                                           sp_argv.data());
+      strumpack.SetPrintFactorStatistics(true);
+      strumpack.SetPrintSolveStatistics(true);
+      strumpack.SetFromCommandLine();
+      strumpack.SetCoordinates(TrueDofCoordinates(fespace),
+                               pmesh.SpaceDimension());
+      strumpack.SetOperator(SA);
+      strumpack.Mult(B, X);
+   }
+   else
+#endif
 #ifdef MFEM_USE_CUDSS
    if (!pa && (Device::Allows(Backend::CUDA_MASK) && cudss_solver))
    {
@@ -305,12 +347,27 @@ int main(int argc, char *argv[])
       delete prec;
    }
 
+   solve_time.Stop();
+   {
+      Vector R(B);
+      A->AddMult(X, R, -1.0);
+      const real_t rel = sqrt(InnerProduct(MPI_COMM_WORLD, R, R) /
+                              InnerProduct(MPI_COMM_WORLD, B, B));
+      if (myid == 0)
+      {
+         cout << "Solver time (" << (strumpack_solver ? "STRUMPACK" : "CG")
+              << ", s): " << solve_time.RealTime()
+              << "  relative residual ||B - A X|| / ||B||: " << rel << endl;
+      }
+   }
+
    // 14. Recover the parallel grid function corresponding to X. This is the
    //     local finite element solution on each processor.
    a.RecoverFEMSolution(X, b, x);
 
    // 15. Save the refined mesh and the solution in parallel. This output can
    //     be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+   if (save)
    {
       ostringstream mesh_name, sol_name;
       mesh_name << "mesh." << setfill('0') << setw(6) << myid;

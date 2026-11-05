@@ -46,6 +46,7 @@
 //               We recommend viewing examples 1-2 before viewing this example.
 
 #include "mfem.hpp"
+#include "strumpack_coordinates.hpp"
 #include <fstream>
 #include <iostream>
 
@@ -66,7 +67,10 @@ int main(int argc, char *argv[])
    int myid = Mpi::WorldRank();
    Hypre::Init();
 
-   // 2. Parse command-line options.
+   // 2. Parse command-line options (STRUMPACK's go after a lone "--").
+   int sp_argc;
+   std::vector<char *> sp_argv;
+   SplitStrumpackArgs(argc, argv, sp_argc, sp_argv);
    const char *mesh_file = "../data/beam-tet.mesh";
    int order = 1;
    bool static_cond = false;
@@ -77,6 +81,12 @@ int main(int argc, char *argv[])
 #ifdef MFEM_USE_AMGX
    bool useAmgX = false;
 #endif
+
+   int ser_ref_levels = -1;
+   int par_ref_levels = 2;
+   bool strumpack_solver = false;
+   bool save = true;
+   double sigma_val = 1.0;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -97,6 +107,23 @@ int main(int argc, char *argv[])
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
+   args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
+                  "Uniform refinements of the serial mesh (-1: up to"
+                  " 1,000 elements).");
+   args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",
+                  "Uniform refinements of the parallel mesh.");
+#ifdef MFEM_USE_STRUMPACK
+   args.AddOption(&strumpack_solver, "-sp", "--strumpack-solver",
+                  "-no-sp", "--no-strumpack-solver",
+                  "Use the STRUMPACK solver; its options go after a lone"
+                  " \"--\" (e.g. -- --sp_compression h2).");
+#endif
+   args.AddOption(&save, "-save", "--save-solution", "-no-save",
+                  "--no-save-solution", "Save the mesh and the solution.");
+   args.AddOption(&sigma_val, "-sigma", "--sigma",
+                  "Mass coefficient: curl curl E + sigma E = f (f stays the"
+                  " one for sigma = 1, so the exact-solution error is"
+                  " meaningful only at 1).");
 #ifdef MFEM_USE_AMGX
    args.AddOption(&useAmgX, "-amgx", "--useAmgX", "-no-amgx",
                   "--no-useAmgX",
@@ -140,7 +167,8 @@ int main(int argc, char *argv[])
    //    'ref_levels' to be the largest number that gives a final mesh with no
    //    more than 1,000 elements.
    {
-      int ref_levels = (int)floor(log(1000./mesh->GetNE())/log(2.)/dim);
+      int ref_levels = ser_ref_levels >= 0 ? ser_ref_levels :
+                       (int)floor(log(1000./mesh->GetNE())/log(2.)/dim);
       for (int l = 0; l < ref_levels; l++)
       {
          mesh->UniformRefinement();
@@ -153,7 +181,6 @@ int main(int argc, char *argv[])
    ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
    delete mesh;
    {
-      int par_ref_levels = 2;
       for (int l = 0; l < par_ref_levels; l++)
       {
          pmesh->UniformRefinement();
@@ -205,7 +232,7 @@ int main(int argc, char *argv[])
    //     operator curl muinv curl + sigma I, by adding the curl-curl and the
    //     mass domain integrators.
    Coefficient *muinv = new ConstantCoefficient(1.0);
-   Coefficient *sigma = new ConstantCoefficient(1.0);
+   Coefficient *sigma = new ConstantCoefficient(sigma_val);
    ParBilinearForm *a = new ParBilinearForm(fespace);
    if (pa) { a->SetAssemblyLevel(AssemblyLevel::PARTIAL); }
    a->AddDomainIntegrator(new CurlCurlIntegrator(*muinv));
@@ -222,7 +249,28 @@ int main(int argc, char *argv[])
    Vector B, X;
    a->FormLinearSystem(ess_tdof_list, x, *b, A, X, B);
 
-   // 13. Solve the system AX=B using PCG with an AMS preconditioner.
+   // 13. Solve the system AX=B using PCG with an AMS preconditioner (or,
+   //     with -sp, STRUMPACK given the coordinates of the unknowns).
+   StopWatch solve_time;
+   solve_time.Start();
+#ifdef MFEM_USE_STRUMPACK
+   if (strumpack_solver)
+   {
+      MFEM_VERIFY(!pa && !static_cond,
+                  "-sp needs the matrix without static condensation");
+      STRUMPACKRowLocMatrix SA(*A.As<HypreParMatrix>());
+      STRUMPACKCoordinatesSolver strumpack(MPI_COMM_WORLD, sp_argc,
+                                           sp_argv.data());
+      strumpack.SetPrintFactorStatistics(true);
+      strumpack.SetPrintSolveStatistics(true);
+      strumpack.SetFromCommandLine();
+      strumpack.SetCoordinates(TrueDofCoordinates(*fespace),
+                               pmesh->SpaceDimension());
+      strumpack.SetOperator(SA);
+      strumpack.Mult(B, X);
+   }
+   else
+#endif
    if (pa)
    {
 #ifdef MFEM_USE_AMGX
@@ -257,6 +305,20 @@ int main(int argc, char *argv[])
       pcg.Mult(B, X);
    }
 
+   solve_time.Stop();
+   {
+      Vector R(B);
+      A->AddMult(X, R, -1.0);
+      const real_t rel = sqrt(InnerProduct(MPI_COMM_WORLD, R, R) /
+                              InnerProduct(MPI_COMM_WORLD, B, B));
+      if (myid == 0)
+      {
+         cout << "Solver time (" << (strumpack_solver ? "STRUMPACK" : "CG")
+              << ", s): " << solve_time.RealTime()
+              << "  relative residual ||B - A X|| / ||B||: " << rel << endl;
+      }
+   }
+
    // 14. Recover the parallel grid function corresponding to X. This is the
    //     local finite element solution on each processor.
    a->RecoverFEMSolution(X, *b, x);
@@ -272,6 +334,7 @@ int main(int argc, char *argv[])
 
    // 16. Save the refined mesh and the solution in parallel. This output can
    //     be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+   if (save)
    {
       ostringstream mesh_name, sol_name;
       mesh_name << "mesh." << setfill('0') << setw(6) << myid;

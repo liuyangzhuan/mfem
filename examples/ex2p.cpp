@@ -40,6 +40,7 @@
 //               We recommend viewing Example 1 before viewing this example.
 
 #include "mfem.hpp"
+#include "strumpack_coordinates.hpp"
 #include <fstream>
 #include <iostream>
 
@@ -54,7 +55,10 @@ int main(int argc, char *argv[])
    int myid = Mpi::WorldRank();
    Hypre::Init();
 
-   // 2. Parse command-line options.
+   // 2. Parse command-line options (STRUMPACK's go after a lone "--").
+   int sp_argc;
+   std::vector<char *> sp_argv;
+   SplitStrumpackArgs(argc, argv, sp_argc, sp_argv);
    const char *mesh_file = "../data/beam-tri.mesh";
    int order = 1;
    bool static_cond = false;
@@ -62,6 +66,11 @@ int main(int argc, char *argv[])
    bool amg_elast = 0;
    bool reorder_space = false;
    const char *device_config = "cpu";
+
+   int ser_ref_levels = -1;
+   int par_ref_levels = 1;
+   bool strumpack_solver = false;
+   bool save = true;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -81,6 +90,19 @@ int main(int argc, char *argv[])
                   "Use byNODES ordering of vector space instead of byVDIM");
    args.AddOption(&device_config, "-d", "--device",
                   "Device configuration string, see Device::Configure().");
+   args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
+                  "Uniform refinements of the serial mesh (-1: up to"
+                  " 1,000 elements).");
+   args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",
+                  "Uniform refinements of the parallel mesh.");
+#ifdef MFEM_USE_STRUMPACK
+   args.AddOption(&strumpack_solver, "-sp", "--strumpack-solver",
+                  "-no-sp", "--no-strumpack-solver",
+                  "Use the STRUMPACK solver; its options go after a lone"
+                  " \"--\" (e.g. -- --sp_compression h2).");
+#endif
+   args.AddOption(&save, "-save", "--save-solution", "-no-save",
+                  "--no-save-solution", "Save the mesh and the solution.");
    args.Parse();
    if (!args.Good())
    {
@@ -136,8 +158,8 @@ int main(int argc, char *argv[])
    //    'ref_levels' to be the largest number that gives a final mesh with no
    //    more than 1,000 elements.
    {
-      int ref_levels =
-         (int)floor(log(1000./mesh->GetNE())/log(2.)/dim);
+      int ref_levels = ser_ref_levels >= 0 ? ser_ref_levels :
+                       (int)floor(log(1000./mesh->GetNE())/log(2.)/dim);
       for (int l = 0; l < ref_levels; l++)
       {
          mesh->UniformRefinement();
@@ -150,7 +172,6 @@ int main(int argc, char *argv[])
    ParMesh *pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
    delete mesh;
    {
-      int par_ref_levels = 1;
       for (int l = 0; l < par_ref_levels; l++)
       {
          pmesh->UniformRefinement();
@@ -267,21 +288,59 @@ int main(int argc, char *argv[])
 
    // 14. Define and apply a parallel PCG solver for A X = B with the BoomerAMG
    //     preconditioner from hypre.
-   HypreBoomerAMG *amg = new HypreBoomerAMG(A);
-   if (amg_elast && !a->StaticCondensationIsEnabled())
+   StopWatch solve_time;
+   solve_time.Start();
+#ifdef MFEM_USE_STRUMPACK
+   if (strumpack_solver)
    {
-      amg->SetElasticityOptions(fespace);
+      MFEM_VERIFY(!static_cond,
+                  "-sp needs the matrix without static condensation");
+      STRUMPACKRowLocMatrix SA(A);
+      STRUMPACKCoordinatesSolver strumpack(MPI_COMM_WORLD, sp_argc,
+                                           sp_argv.data());
+      strumpack.SetPrintFactorStatistics(true);
+      strumpack.SetPrintSolveStatistics(true);
+      strumpack.SetFromCommandLine();
+      strumpack.SetCoordinates(TrueDofCoordinates(*fespace),
+                               pmesh->SpaceDimension());
+      strumpack.SetOperator(SA);
+      strumpack.Mult(B, X);
    }
    else
+#endif
    {
-      amg->SetSystemsOptions(dim, reorder_space);
+      HypreBoomerAMG *amg = new HypreBoomerAMG(A);
+      if (amg_elast && !a->StaticCondensationIsEnabled())
+      {
+         amg->SetElasticityOptions(fespace);
+      }
+      else
+      {
+         amg->SetSystemsOptions(dim, reorder_space);
+      }
+      HyprePCG *pcg = new HyprePCG(A);
+      pcg->SetTol(1e-8);
+      pcg->SetMaxIter(500);
+      pcg->SetPrintLevel(2);
+      pcg->SetPreconditioner(*amg);
+      pcg->Mult(B, X);
+      delete pcg;
+      delete amg;
    }
-   HyprePCG *pcg = new HyprePCG(A);
-   pcg->SetTol(1e-8);
-   pcg->SetMaxIter(500);
-   pcg->SetPrintLevel(2);
-   pcg->SetPreconditioner(*amg);
-   pcg->Mult(B, X);
+   solve_time.Stop();
+   {
+      Vector R(B);
+      A.AddMult(X, R, -1.0);
+      const real_t rel = sqrt(InnerProduct(MPI_COMM_WORLD, R, R) /
+                              InnerProduct(MPI_COMM_WORLD, B, B));
+      if (myid == 0)
+      {
+         cout << "Solver time (" << (strumpack_solver ? "STRUMPACK" : "CG")
+              << ", s): " << solve_time.RealTime()
+              << "  relative residual ||B - A X|| / ||B||: " << rel << endl;
+      }
+   }
+
 
    // 15. Recover the parallel grid function corresponding to X. This is the
    //     local finite element solution on each processor.
@@ -302,6 +361,7 @@ int main(int argc, char *argv[])
    // 17. Save in parallel the displaced mesh and the inverted solution (which
    //     gives the backward displacements to the original grid). This output
    //     can be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+   if (save)
    {
       GridFunction *nodes = pmesh->GetNodes();
       *nodes += x;
@@ -333,8 +393,6 @@ int main(int argc, char *argv[])
    }
 
    // 19. Free the used memory.
-   delete pcg;
-   delete amg;
    delete a;
    delete b;
    if (fec)
